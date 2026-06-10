@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NYC N Train Live</title>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-57NL6ZY4T3"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag("js", new Date());
+      gtag("config", "G-57NL6ZY4T3");
+    </script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app" aria-label="NYC N train live visualizer">
+      <div id="map" aria-label="Live N train movement scene"></div>
+      <div class="atmosphere" aria-hidden="true"></div>
+      <header class="brand" aria-label="NYC N Train">
+        <div class="route-badge" aria-hidden="true">N</div>
+        <div class="brand-title">
+          <span>NYC</span>
+          <strong>N TRAIN</strong>
+        </div>
+      </header>
+      <div id="fallback" class="fallback" role="status" aria-live="polite"></div>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

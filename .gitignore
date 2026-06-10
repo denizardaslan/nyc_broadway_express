@@ -1,0 +1,6 @@
+.cache/
+server.log
+server.pid
+screenshot*.png
+node_modules/
+.DS_Store
