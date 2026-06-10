@@ -1,6 +1,14 @@
 # NYC N Broadway Express
 
-A live visualizer for New York City's N Broadway Express using MTA GTFS Realtime data.
+A clean, visual live map for New York City's N Broadway Express using MTA GTFS Realtime data.
+
+## Live
+
+[denizaa.com/nyc-broadway-express](https://denizaa.com/nyc-broadway-express/)
+
+## Preview
+
+![NYC N Broadway Express sample](docs/sample.jpg)
 
 ## Run locally
 
