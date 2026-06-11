@@ -7,6 +7,8 @@ const MAX_METERS_PER_SECOND = 18;
 const MAX_CORRECTION_METERS = 420;
 const CORRECTION_SECONDS = 22;
 const VELOCITY_BLEND = 0.42;
+const PROJECTION_DISTANCE_WEIGHT = 0.42;
+const REVERSE_CORRECTION_TOLERANCE = 2.5;
 
 const map = L.map("map", {
   attributionControl: false,
@@ -111,7 +113,7 @@ function rebuildRouteSamples() {
   }
 }
 
-function projectToRoute(latLng) {
+function projectToRoute(latLng, preferredDistance = null) {
   const point = map.latLngToLayerPoint(latLng);
   let best = null;
 
@@ -123,13 +125,19 @@ function projectToRoute(latLng) {
     const t = clamp((wx * vx + wy * vy) / (segment.length * segment.length), 0, 1);
     const candidate = interpolatePoint(segment.a, segment.b, t);
     const offRoute = pointDistance(point, candidate);
+    const distance = segment.distance + segment.length * t;
+    const distancePenalty = Number.isFinite(preferredDistance)
+      ? Math.abs(distance - preferredDistance) * PROJECTION_DISTANCE_WEIGHT
+      : 0;
+    const score = offRoute + distancePenalty;
 
-    if (!best || offRoute < best.offRoute) {
+    if (!best || score < best.score) {
       best = {
         angle: segment.angle,
-        distance: segment.distance + segment.length * t,
+        distance,
         offRoute,
-        point: candidate
+        point: candidate,
+        score
       };
     }
   }
@@ -224,13 +232,14 @@ function chooseVisualTrains(items) {
     if (!item) continue;
     if (selected.length >= MAX_VISIBLE_TRAINS) break;
 
-    const projected = projectToRoute(L.latLng(item.lat, item.lon));
+    const existing = trains.get(id);
+    const projected = projectToRoute(L.latLng(item.lat, item.lon), existing?.distance);
     const key = Math.round(projected.distance / 42);
     const bucketCount = buckets.get(key) || 0;
     if (bucketCount >= 2) continue;
 
     buckets.set(key, bucketCount + 1);
-    selected.push({ item, offset: directionSign(trains.get(id).directionId) * bucketCount * 22, projected });
+    selected.push({ item, offset: directionSign(existing.directionId) * bucketCount * 22, projected });
     used.add(id);
   }
 
@@ -319,7 +328,12 @@ async function refreshTrains() {
         : velocityForItem(item);
       existing.velocity = clampVelocity(existing.velocity);
       existing.element.classList.toggle("is-predicting", predictive);
-      existing.correction = clampCorrection(existing.correction + rawTargetDistance - existing.distance);
+
+      const targetDelta = rawTargetDistance - existing.distance;
+      const correctionDirectionallyValid = Math.sign(targetDelta || expectedDirection) === expectedDirection;
+      existing.correction = correctionDirectionallyValid || Math.abs(targetDelta) <= REVERSE_CORRECTION_TOLERANCE
+        ? clampCorrection(existing.correction + targetDelta)
+        : 0;
       existing.lastObservedAt = observedAt;
       existing.lastObservedDistance = rawTargetDistance;
     } else {
