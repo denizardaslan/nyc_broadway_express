@@ -1,7 +1,8 @@
 # NYC Broadway Express
 
-A live map of every N train in New York City, placed on the real track from the
-MTA's GTFS-Realtime feed.
+A live portrait of one subway line: New York behind, the Broadway line in front,
+and every N train moving on it in real time. No controls, no panels — it is meant
+to be left running on a screen.
 
 ## Live
 
@@ -59,11 +60,18 @@ Position is then a pure function of those two timestamps and the clock. The
 browser re-evaluates it every frame against a server-synchronised clock, which is
 why the picture is identical in two tabs and survives a reload.
 
-## What the speed means
+## The picture
 
-Trains are drawn at the speed the feed implies — roughly 3 px every 20 seconds
-at whole-line zoom, because the line is 35 km long. That is real, not a stall.
-Zoom in, or select a train and follow it, to see it move.
+* **Day and night.** The page follows the hour in New York: paper and ink by day,
+  a dark city with a glowing line after 19:00. Force one with `?theme=day` or
+  `?theme=night`.
+* **Trains** are beads of light with a tail, each direction riding its own side
+  of the track. A train standing at a platform loses its tail, breathes, and
+  sends a ring out across the station.
+* **Speed is real.** A train covers roughly 3 px every 20 seconds at whole-line
+  framing, because the line is 35 km long. That is not a stall.
+* **You can still look closer.** Drag and pinch work; leave it alone for 25
+  seconds and the view eases back to its framing on its own.
 
 ## API
 

@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>N Train Live — NYC Broadway Line</title>
-    <meta name="description" content="Every N train in New York City, placed on the real track from the MTA's live feed.">
+    <title>N — a live portrait of the Broadway line</title>
+    <meta name="description" content="Every N train in New York City, moving in real time. A quiet, living picture of one subway line.">
     <meta name="theme-color" content="#f4f1e8">
     <script async src="https://www.googletagmanager.com/gtag/js?id=G-57NL6ZY4T3"></script>
     <script>
@@ -18,49 +18,23 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <main class="app">
-      <div id="map" role="application" aria-label="Live map of N trains in New York City"></div>
+    <main class="scene">
+      <div id="map" aria-label="Every N train in New York City, moving in real time"></div>
+      <div class="grain" aria-hidden="true"></div>
+      <div class="vignette" aria-hidden="true"></div>
 
-      <header class="brand">
-        <div class="bullet" aria-hidden="true">N</div>
-        <div class="brand-text">
-          <strong>N Train</strong>
-          <span>Astoria–Ditmars Blvd ↔ Coney Island–Stillwell Av</span>
-        </div>
+      <header class="mark" aria-hidden="true">
+        <span class="bullet">N</span>
+        <span class="wordmark">
+          <b>Broadway</b>
+          <i>New York City</i>
+        </span>
       </header>
 
-      <div class="status" id="status" role="status" aria-live="polite">
-        <span class="status-dot" id="status-dot"></span>
-        <span class="status-count" id="status-count">—</span>
-        <span class="status-note" id="status-note">connecting to the MTA feed</span>
-      </div>
-
-      <aside class="card" id="card" hidden>
-        <button class="card-close" id="card-close" type="button" aria-label="Close">×</button>
-        <div id="card-body"></div>
-      </aside>
-
-      <div class="tools">
-        <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
-        <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
-        <button type="button" id="fit" aria-label="Show the whole line">⤢</button>
-      </div>
-
-      <section class="strip" id="strip" aria-label="Whole line at a glance">
-        <div class="strip-head">
-          <span>Whole line</span>
-          <span class="strip-legend">
-            <i class="to-astoria"></i> to Astoria
-            <i class="to-coney"></i> to Coney Island
-          </span>
-        </div>
-        <svg id="strip-svg" preserveAspectRatio="none" aria-hidden="true"></svg>
-      </section>
-
-      <p class="footnote">
-        Live positions from the MTA GTFS-Realtime feed, placed on GTFS track geometry.
-        Trains move at their real speed — zoom in, or tap one to follow it.
-      </p>
+      <footer class="caption" aria-hidden="true">
+        <span class="terminals">Astoria–Ditmars Blvd &nbsp;·&nbsp; Coney Island–Stillwell Av</span>
+        <span class="pulse" id="pulse"><i></i><span id="count">—</span> trains running</span>
+      </footer>
     </main>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
