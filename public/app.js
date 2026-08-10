@@ -1,394 +1,647 @@
-const REFRESH_MS = 20_000;
-const LINE_COLOR = "#fccc0a";
-const MAX_VISIBLE_TRAINS = 26;
-const TANGENT_LOOKAHEAD = 22;
-const DEFAULT_METERS_PER_SECOND = 10.5;
-const MAX_METERS_PER_SECOND = 18;
-const MAX_CORRECTION_METERS = 420;
-const CORRECTION_SECONDS = 22;
-const VELOCITY_BLEND = 0.42;
-const PROJECTION_DISTANCE_WEIGHT = 0.42;
-const REVERSE_CORRECTION_TOLERANCE = 2.5;
+/**
+ * Draws every N train on the real track, at the position the MTA feed implies
+ * for *this instant*.
+ *
+ * The server hands each train a link (the stretch of track between two stops)
+ * and the two timestamps that bound it. Position is then a pure function of the
+ * clock, which is why the picture is identical in two tabs and survives a
+ * reload — there is no simulation carrying state between frames.
+ */
+
+const POLL_MS = 15_000;
+const STALE_AFTER_S = 90;
+const FOLLOW_ZOOM = 15;
+const RECONCILE_TAU = 0.35;
+const LABEL_ZOOM = 13.5;
+/** Nudge each direction onto its own side of the line, as the tracks are. */
+const TRACK_OFFSET_PX = 5;
+
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const dom = {
+  status: document.getElementById("status"),
+  statusDot: document.getElementById("status-dot"),
+  statusCount: document.getElementById("status-count"),
+  statusNote: document.getElementById("status-note"),
+  card: document.getElementById("card"),
+  cardBody: document.getElementById("card-body"),
+  cardClose: document.getElementById("card-close"),
+  strip: document.getElementById("strip"),
+  stripSvg: document.getElementById("strip-svg")
+};
 
 const map = L.map("map", {
   attributionControl: false,
-  boxZoom: false,
-  doubleClickZoom: false,
-  dragging: false,
-  keyboard: false,
-  scrollWheelZoom: false,
-  touchZoom: false,
   zoomControl: false,
-  zoomDelta: 0.1,
-  zoomSnap: 0.1
-}).setView([40.735, -73.985], 11);
+  zoomSnap: 0.25,
+  zoomDelta: 0.5,
+  minZoom: 10,
+  maxZoom: 17
+}).setView([40.72, -73.98], 11);
 
 L.tileLayer("https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png", {
-  maxZoom: 20
+  maxZoom: 19,
+  detectRetina: true
 }).addTo(map);
 
-const fallbackEl = document.querySelector("#fallback");
-const trainLayer = L.DomUtil.create("div", "train-layer", map.getPanes().overlayPane);
+const trainPane = map.createPane("trains");
+trainPane.style.zIndex = 620;
+trainPane.style.pointerEvents = "none";
+
+let network = null;
+let clockOffset = 0;
+const offsetSamples = [];
+
 const trains = new Map();
+const geometryCache = new Map();
+const stationMarkers = new Map();
 
-let routeLatLngs = [];
-let routeLine;
-let routeSamples = [];
-let totalRouteDistance = 0;
-let totalRouteMeters = 0;
-let lastFrameTime = performance.now();
-let animationStarted = false;
+let homeBounds = null;
+let selection = null; // { kind: "train" | "station", id }
+let following = false;
+let lastFrame = performance.now();
+let stripFrame = 0;
+let lastPayload = null;
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
+// ------------------------------------------------------------------ utilities
 
-function interpolatePoint(a, b, t) {
-  return L.point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
-}
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const baseId = (stopId = "") => stopId.replace(/[NS]$/, "");
+const serverNow = () => Date.now() / 1000 + clockOffset;
 
-function pointDistance(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-function directionSign(directionId) {
-  return directionId === 1 ? -1 : 1;
+/** Matches the easing the server uses, so both agree on where a train is. */
+function ease(t) {
+  const smooth = t * t * (3 - 2 * t);
+  return t * 0.55 + smooth * 0.45;
 }
 
 function shortestAngle(from, to) {
   return ((to - from + 540) % 360) - 180;
 }
 
-function pixelsPerMeter() {
-  return totalRouteMeters ? totalRouteDistance / totalRouteMeters : 0;
+function countdown(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 30) return "now";
+  if (seconds < 90) return "1 min";
+  return `${Math.round(seconds / 60)} min`;
 }
 
-function defaultVelocity(directionId) {
-  return directionSign(directionId) * DEFAULT_METERS_PER_SECOND * pixelsPerMeter();
+function stationName(stopId) {
+  return network?.stations[baseId(stopId)]?.name || "—";
 }
 
-function shouldPredict(item) {
-  return item.status === 2;
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]
+  ));
 }
 
-function velocityForItem(item) {
-  return shouldPredict(item) ? defaultVelocity(item.directionId) : 0;
+// ------------------------------------------------------------------- geometry
+
+/**
+ * Segment geometry in Leaflet layer pixels, with cumulative lengths so we can
+ * address a point by "fraction of the way along". Rebuilt whenever the map's
+ * pixel origin changes, i.e. on zoom.
+ */
+function geometryFor(key) {
+  const cached = geometryCache.get(key);
+  if (cached) return cached;
+
+  const segment = network.segments[key];
+  if (!segment) return null;
+
+  const points = segment.path.map(([lat, lon]) => map.latLngToLayerPoint(L.latLng(lat, lon)));
+  const cumulative = [0];
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += points[i].distanceTo(points[i - 1]);
+    cumulative.push(total);
+  }
+
+  const geometry = { points, cumulative, length: total };
+  geometryCache.set(key, geometry);
+  return geometry;
 }
 
-function clampVelocity(velocity) {
-  const max = MAX_METERS_PER_SECOND * pixelsPerMeter();
-  return clamp(velocity, -max, max);
+/** Point and heading at a fraction along a link. */
+function pointAlong(geometry, fraction) {
+  const target = clamp(fraction, 0, 1) * geometry.length;
+  let index = 0;
+  while (index < geometry.cumulative.length - 2 && geometry.cumulative[index + 1] < target) index += 1;
+
+  const start = geometry.cumulative[index];
+  const span = geometry.cumulative[index + 1] - start || 1;
+  const t = clamp((target - start) / span, 0, 1);
+  const a = geometry.points[index];
+  const b = geometry.points[index + 1] ?? a;
+
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    angle: (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI
+  };
 }
 
-function clampCorrection(distance) {
-  const max = Math.max(8, MAX_CORRECTION_METERS * pixelsPerMeter());
-  return clamp(distance, -max, max);
-}
+// -------------------------------------------------------------- the line itself
 
-function rebuildRouteSamples() {
-  const points = routeLatLngs.map((latLng) => map.latLngToLayerPoint(latLng));
-  routeSamples = [];
-  totalRouteDistance = 0;
-  totalRouteMeters = 0;
+function drawNetwork() {
+  const casing = [];
+  const core = [];
 
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const a = points[index];
-    const b = points[index + 1];
-    const length = pointDistance(a, b);
-    if (length < 0.1) continue;
-    const meters = routeLatLngs[index].distanceTo(routeLatLngs[index + 1]);
+  for (const edge of network.edges) {
+    const latLngs = edge.path.map(([lat, lon]) => L.latLng(lat, lon));
+    casing.push(L.polyline(latLngs, { className: "rail-casing", interactive: false }));
+    core.push(L.polyline(latLngs, { className: "rail-core", color: network.route.color, interactive: false }));
+  }
 
-    routeSamples.push({
-      a,
-      b,
-      angle: Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI,
-      distance: totalRouteDistance,
-      length,
-      meters
+  L.layerGroup(casing).addTo(map);
+  L.layerGroup(core).addTo(map);
+
+  for (const station of Object.values(network.stations)) {
+    const marker = L.circleMarker([station.lat, station.lon], {
+      className: station.terminal ? "station station-terminal" : "station",
+      radius: station.terminal ? 6.5 : 4,
+      weight: 2.5,
+      color: "#141414",
+      fillColor: "#ffffff",
+      fillOpacity: 1,
+      bubblingMouseEvents: false
     });
-    totalRouteDistance += length;
-    totalRouteMeters += meters;
+
+    marker.bindTooltip(station.name, {
+      direction: "top",
+      offset: [0, -6],
+      className: "station-tip",
+      permanent: false
+    });
+    marker.on("click", () => select({ kind: "station", id: station.id }));
+    marker.addTo(map);
+    stationMarkers.set(station.id, marker);
+  }
+
+  homeBounds = L.latLngBounds(Object.values(network.stations).map((s) => [s.lat, s.lon]));
+  map.fitBounds(homeBounds, { animate: false, paddingTopLeft: [56, 90], paddingBottomRight: [56, 130] });
+  map.setMinZoom(map.getZoom() - 0.5);
+}
+
+/**
+ * At whole-line zoom a train is a dot; close in it becomes a car with a trail.
+ * Drawing the detailed marker at every zoom just turns the line into blobs.
+ */
+function refreshScale() {
+  const zoom = map.getZoom();
+  trainPane.dataset.scale = zoom < 12.5 ? "dot" : zoom < 14.5 ? "small" : "full";
+}
+
+function refreshLabels() {
+  const showAll = map.getZoom() >= LABEL_ZOOM;
+  for (const [id, marker] of stationMarkers) {
+    const station = network.stations[id];
+    const permanent = showAll || station.terminal;
+    const tooltip = marker.getTooltip();
+    if (!tooltip || tooltip.options.permanent === permanent) continue;
+    marker.unbindTooltip();
+    marker.bindTooltip(station.name, {
+      direction: "top",
+      offset: [0, -6],
+      className: `station-tip${permanent ? " is-permanent" : ""}`,
+      permanent
+    });
   }
 }
 
-function projectToRoute(latLng, preferredDistance = null) {
-  const point = map.latLngToLayerPoint(latLng);
-  let best = null;
+// ---------------------------------------------------------------------- trains
 
-  for (const segment of routeSamples) {
-    const vx = segment.b.x - segment.a.x;
-    const vy = segment.b.y - segment.a.y;
-    const wx = point.x - segment.a.x;
-    const wy = point.y - segment.a.y;
-    const t = clamp((wx * vx + wy * vy) / (segment.length * segment.length), 0, 1);
-    const candidate = interpolatePoint(segment.a, segment.b, t);
-    const offRoute = pointDistance(point, candidate);
-    const distance = segment.distance + segment.length * t;
-    const distancePenalty = Number.isFinite(preferredDistance)
-      ? Math.abs(distance - preferredDistance) * PROJECTION_DISTANCE_WEIGHT
-      : 0;
-    const score = offRoute + distancePenalty;
+function makeTrainElement(train) {
+  const element = document.createElement("button");
+  element.type = "button";
+  element.className = "train";
+  element.dataset.id = train.id;
+  element.dataset.direction = train.directionId === 0 ? "astoria" : "coney";
+  element.setAttribute("aria-label", `N train to ${train.destination || "the end of the line"}`);
+  element.innerHTML = '<span class="trail"></span><span class="body"></span><span class="nose"></span>';
+  element.addEventListener("click", (event) => {
+    event.stopPropagation();
+    select({ kind: "train", id: train.id });
+  });
+  trainPane.append(element);
+  return element;
+}
 
-    if (!best || score < best.score) {
-      best = {
-        angle: segment.angle,
-        distance,
-        offRoute,
-        point: candidate,
-        score
-      };
+function targetFraction(train, now) {
+  if (!train.data.segment) return 1;
+  const span = train.data.arrivesAt - train.data.departedAt;
+  if (!(span > 0)) return 1;
+  if (train.data.atStation) return 1;
+  return clamp((now - train.data.departedAt) / span, 0, 1);
+}
+
+/** Where the train sits on the straight-line diagram, in metres from Astoria. */
+function spineMeters(train, fraction) {
+  const from = network.stations[baseId(train.data.from || "")];
+  const to = network.stations[baseId(train.data.to || "")];
+  if (to?.meters === null || to?.meters === undefined) return null;
+  if (from?.meters === null || from?.meters === undefined) return to.meters;
+  return from.meters + (to.meters - from.meters) * fraction;
+}
+
+function renderTrains(dt, now) {
+  for (const train of trains.values()) {
+    const target = ease(targetFraction(train, now));
+
+    if (train.rendered === null || train.snap) {
+      train.rendered = target;
+      train.snap = false;
+    } else {
+      const pull = reduceMotion ? 1 : 1 - Math.exp(-dt / RECONCILE_TAU);
+      train.rendered += (target - train.rendered) * pull;
     }
-  }
 
-  return best || { angle: -90, distance: 0, point };
-}
+    const geometry = train.data.segment ? geometryFor(train.data.segment) : null;
+    let placed;
 
-function rawPointAtDistance(distance) {
-  const bounded = clamp(distance, 0, totalRouteDistance);
-  const last = routeSamples[routeSamples.length - 1];
-  const segment = routeSamples.find((item) => bounded <= item.distance + item.length) || last;
-  const t = clamp((bounded - segment.distance) / segment.length, 0, 1);
+    if (geometry) {
+      placed = pointAlong(geometry, train.rendered);
+    } else {
+      const station = network.stations[baseId(train.data.to || "")];
+      if (!station) continue;
+      const point = map.latLngToLayerPoint([station.lat, station.lon]);
+      placed = { x: point.x, y: point.y, angle: train.angle ?? 0 };
+    }
 
-  return {
-    segment,
-    point: interpolatePoint(segment.a, segment.b, t)
-  };
-}
+    train.angle = train.angle === null
+      ? placed.angle
+      : train.angle + shortestAngle(train.angle, placed.angle) * (reduceMotion ? 1 : Math.min(1, dt * 6));
 
-function tangentAngleAtDistance(distance, directionId) {
-  const sign = directionSign(directionId);
-  const behind = rawPointAtDistance(distance - sign * TANGENT_LOOKAHEAD).point;
-  const ahead = rawPointAtDistance(distance + sign * TANGENT_LOOKAHEAD).point;
-  return Math.atan2(ahead.y - behind.y, ahead.x - behind.x) * 180 / Math.PI;
-}
+    const side = train.data.directionId === 0 ? -1 : 1;
+    const radians = (train.angle * Math.PI) / 180;
+    placed.x += -Math.sin(radians) * TRACK_OFFSET_PX * side;
+    placed.y += Math.cos(radians) * TRACK_OFFSET_PX * side;
 
-function pointAtDistance(distance, directionId) {
-  const sampled = rawPointAtDistance(distance);
-  return {
-    angle: tangentAngleAtDistance(distance, directionId),
-    point: sampled.point
-  };
-}
-
-function makeTrainElement(directionId) {
-  const node = document.createElement("div");
-  node.className = "train";
-  node.dataset.direction = directionId === 1 ? "south" : "north";
-  node.innerHTML = [
-    '<span class="motion motion-a"></span>',
-    '<span class="motion motion-b"></span>',
-    '<span class="motion motion-c"></span>',
-    '<span class="car"></span>',
-    '<span class="beacon"></span>'
-  ].join("");
-  trainLayer.append(node);
-  return node;
-}
-
-function placeTrain(train) {
-  const projected = pointAtDistance(train.distance, train.directionId);
-  train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${projected.angle}deg)`;
-}
-
-function renderFrame(now) {
-  const dt = Math.min(0.05, (now - lastFrameTime) / 1000);
-  lastFrameTime = now;
-
-  for (const train of trains.values()) {
-    const correctionStep = train.correction * Math.min(1, dt / CORRECTION_SECONDS);
-    train.correction -= correctionStep;
-    train.distance = clamp(train.distance + train.velocity * dt + correctionStep, 0, totalRouteDistance);
-    const routeAngle = tangentAngleAtDistance(train.distance, train.directionId);
-    train.angle = (train.angle ?? routeAngle) + shortestAngle(train.angle ?? routeAngle, routeAngle) * 0.18;
-    train.distanceRatio = totalRouteDistance ? train.distance / totalRouteDistance : 0;
-    const projected = rawPointAtDistance(train.distance);
-    train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${train.angle}deg)`;
-  }
-
-  requestAnimationFrame(renderFrame);
-}
-
-function syncTrainsToMap() {
-  rebuildRouteSamples();
-  for (const train of trains.values()) {
-    train.distance = clamp(train.distanceRatio * totalRouteDistance, 0, totalRouteDistance);
-    const projected = pointAtDistance(train.distance, train.directionId);
-    train.velocity = 0;
-    train.correction = 0;
-    train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${projected.angle}deg)`;
+    train.point = placed;
+    train.element.style.transform = `translate3d(${placed.x.toFixed(1)}px, ${placed.y.toFixed(1)}px, 0) rotate(${train.angle.toFixed(1)}deg)`;
+    train.element.classList.toggle("is-dwelling", Boolean(train.data.atStation));
+    train.spine = spineMeters(train, train.rendered);
   }
 }
 
-function chooseVisualTrains(items) {
-  const byId = new Map(items.map((item) => [item.id, item]));
-  const buckets = new Map();
-  const selected = [];
-  const used = new Set();
-
-  for (const id of trains.keys()) {
-    const item = byId.get(id);
-    if (!item) continue;
-    if (selected.length >= MAX_VISIBLE_TRAINS) break;
-
-    const existing = trains.get(id);
-    const projected = projectToRoute(L.latLng(item.lat, item.lon), existing?.distance);
-    const key = Math.round(projected.distance / 42);
-    const bucketCount = buckets.get(key) || 0;
-    if (bucketCount >= 2) continue;
-
-    buckets.set(key, bucketCount + 1);
-    selected.push({ item, offset: directionSign(existing.directionId) * bucketCount * 22, projected });
-    used.add(id);
-  }
-
-  const sorted = items.filter((item) => !used.has(item.id)).sort((a, b) => {
-    const aTime = Date.parse(a.vehicleTimestamp || a.nextArrival || 0);
-    const bTime = Date.parse(b.vehicleTimestamp || b.nextArrival || 0);
-    return bTime - aTime;
-  });
-
-  for (const item of sorted) {
-    const projected = projectToRoute(L.latLng(item.lat, item.lon));
-    const key = Math.round(projected.distance / 42);
-    const bucketCount = buckets.get(key) || 0;
-    if (bucketCount >= 2) continue;
-
-    buckets.set(key, bucketCount + 1);
-    selected.push({ item, offset: directionSign(item.directionId) * bucketCount * 22, projected });
-    if (selected.length >= MAX_VISIBLE_TRAINS) break;
-  }
-
-  return selected;
-}
-
-async function loadRoute() {
-  const response = await fetch("/api/route");
-  if (!response.ok) throw new Error("N hattı yüklenemedi");
-  const route = await response.json();
-
-  routeLatLngs = route.shape.map((point) => L.latLng(point.lat, point.lon));
-
-  L.polyline(routeLatLngs, {
-    className: "route-rail",
-    color: "#171717",
-    interactive: false,
-    opacity: 1,
-    weight: 13
-  }).addTo(map);
-
-  L.polyline(routeLatLngs, {
-    className: "route-line",
-    color: LINE_COLOR,
-    interactive: false,
-    opacity: 1,
-    weight: 7
-  }).addTo(map);
-
-  routeLine = L.polyline(routeLatLngs, {
-    className: "route-center",
-    color: "#171717",
-    interactive: false,
-    opacity: 0.9,
-    weight: 1.25
-  }).addTo(map);
-
-  map.fitBounds(routeLine.getBounds(), {
-    animate: false,
-    paddingTopLeft: [82, 36],
-    paddingBottomRight: [64, 36]
-  });
-  rebuildRouteSamples();
-}
-
-async function refreshTrains() {
-  const response = await fetch("/api/trains");
-  if (!response.ok) throw new Error("Canlı tren verisi alınamadı");
-  const payload = await response.json();
+function syncTrains(payload) {
   const seen = new Set();
-  const visualTrains = chooseVisualTrains(payload.trains);
 
-  for (const { item, offset, projected } of visualTrains) {
-    seen.add(item.id);
-    const rawTargetDistance = clamp(projected.distance + offset, 0, totalRouteDistance);
-    const existing = trains.get(item.id);
-    const observedAt = Date.parse(payload.updatedAt) || Date.now();
-    const predictive = shouldPredict(item);
+  for (const data of payload.trains) {
+    seen.add(data.id);
+    const existing = trains.get(data.id);
 
     if (existing) {
-      const elapsed = Math.max(1, (observedAt - existing.lastObservedAt) / 1000);
-      const observedDelta = rawTargetDistance - existing.lastObservedDistance;
-      const observedVelocity = clampVelocity((rawTargetDistance - existing.lastObservedDistance) / elapsed);
-      const expectedDirection = directionSign(existing.directionId);
-      const directionallyValid = Math.sign(observedVelocity || expectedDirection) === expectedDirection;
-
-      existing.velocity = predictive && elapsed > 4 && directionallyValid && Math.abs(observedDelta) > 0.5
-        ? existing.velocity * (1 - VELOCITY_BLEND) + observedVelocity * VELOCITY_BLEND
-        : velocityForItem(item);
-      existing.velocity = clampVelocity(existing.velocity);
-      existing.element.classList.toggle("is-predicting", predictive);
-
-      const targetDelta = rawTargetDistance - existing.distance;
-      const correctionDirectionallyValid = Math.sign(targetDelta || expectedDirection) === expectedDirection;
-      existing.correction = correctionDirectionallyValid || Math.abs(targetDelta) <= REVERSE_CORRECTION_TOLERANCE
-        ? clampCorrection(existing.correction + targetDelta)
-        : 0;
-      existing.lastObservedAt = observedAt;
-      existing.lastObservedDistance = rawTargetDistance;
+      // A new link restarts the fraction at 0, so smoothing towards it would
+      // drag the train backwards. Geometry is continuous across links anyway.
+      existing.snap = existing.data.segment !== data.segment;
+      existing.data = data;
     } else {
-      const element = makeTrainElement(item.directionId);
-      element.dataset.trainId = item.id;
-      const target = pointAtDistance(rawTargetDistance, item.directionId);
       const train = {
-        correction: 0,
-        directionId: item.directionId,
-        distance: rawTargetDistance,
-        distanceRatio: totalRouteDistance ? rawTargetDistance / totalRouteDistance : 0,
-        element,
-        lastObservedAt: observedAt,
-        lastObservedDistance: rawTargetDistance,
-        velocity: velocityForItem(item)
+        id: data.id,
+        data,
+        element: null,
+        rendered: null,
+        angle: null,
+        snap: false,
+        point: null,
+        spine: null
       };
-      train.angle = target.angle;
-      trains.set(item.id, train);
-      element.classList.toggle("is-predicting", predictive);
-      train.element.style.transform = `translate3d(${target.point.x}px, ${target.point.y}px, 0) rotate(${target.angle}deg)`;
-      requestAnimationFrame(() => element.classList.add("is-live"));
+      train.element = makeTrainElement(data);
+      trains.set(data.id, train);
     }
   }
 
   for (const [id, train] of trains) {
-    if (!seen.has(id)) {
-      train.element.classList.add("is-leaving");
-      setTimeout(() => train.element.remove(), 300);
-      trains.delete(id);
+    if (seen.has(id)) continue;
+    train.element.remove();
+    trains.delete(id);
+    if (selection?.kind === "train" && selection.id === id) clearSelection();
+  }
+
+  applySelectionClasses();
+}
+
+// ------------------------------------------------------------- the line strip
+
+function renderStrip(now) {
+  if (!network) return;
+  const width = Math.round(dom.stripSvg.getBoundingClientRect().width);
+  const height = 64;
+  if (!width) return;
+
+  const padding = 18;
+  const usable = width - padding * 2;
+  const axis = height / 2;
+  const x = (meters) => padding + (meters / network.spine.length) * usable;
+
+  const parts = [`<line class="strip-axis" x1="${padding}" y1="${axis}" x2="${width - padding}" y2="${axis}"/>`];
+
+  for (const id of network.spine.stops) {
+    const station = network.stations[id];
+    if (!station || station.meters === null) continue;
+    const px = x(station.meters);
+    parts.push(`<line class="strip-tick${station.terminal ? " is-terminal" : ""}" x1="${px}" y1="${axis - (station.terminal ? 7 : 4)}" x2="${px}" y2="${axis + (station.terminal ? 7 : 4)}"/>`);
+  }
+
+  for (const train of trains.values()) {
+    if (train.spine === null || train.spine === undefined) continue;
+    const px = x(train.spine);
+    const up = train.data.directionId === 0;
+    const py = axis + (up ? -13 : 13);
+    const selected = selection?.kind === "train" && selection.id === train.id;
+    parts.push(`<circle class="strip-train ${up ? "to-astoria" : "to-coney"}${selected ? " is-selected" : ""}" data-id="${escapeHtml(train.id)}" cx="${px.toFixed(1)}" cy="${py}" r="${selected ? 6 : 4.2}"/>`);
+  }
+
+  parts.push(`<text class="strip-label" x="${padding}" y="${height - 2}">Astoria–Ditmars Blvd</text>`);
+  parts.push(`<text class="strip-label" x="${width - padding}" y="${height - 2}" text-anchor="end">Coney Island–Stillwell Av</text>`);
+
+  dom.stripSvg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  dom.stripSvg.setAttribute("height", height);
+  dom.stripSvg.innerHTML = parts.join("");
+}
+
+dom.stripSvg.addEventListener("click", (event) => {
+  const id = event.target?.dataset?.id;
+  if (id) select({ kind: "train", id });
+});
+
+// -------------------------------------------------------------------- details
+
+function arrivalsAt(stationId, now) {
+  const rows = [];
+
+  for (const train of trains.values()) {
+    for (const stop of train.data.stops) {
+      if (baseId(stop.id) !== stationId) continue;
+      rows.push({
+        seconds: stop.at - now,
+        destination: train.data.destination,
+        directionId: train.data.directionId,
+        id: train.id
+      });
+      break;
     }
   }
 
-  fallbackEl.classList.remove("is-visible");
+  return rows.filter((row) => row.seconds > -60).sort((a, b) => a.seconds - b.seconds);
 }
+
+function trainCard(train, now) {
+  const data = train.data;
+  const eta = Math.round(data.arrivesAt - now);
+  const percent = Math.round((train.rendered ?? 0) * 100);
+  const where = data.atStation || !data.segment
+    ? `At <strong>${escapeHtml(stationName(data.to))}</strong>`
+    : `${escapeHtml(stationName(data.from))} → <strong>${escapeHtml(stationName(data.to))}</strong>`;
+
+  const upcoming = data.stops.slice(0, 6).map((stop) => `
+    <li data-at="${stop.at}"><span>${escapeHtml(stationName(stop.id))}</span><em>${countdown(stop.at - now)}</em></li>
+  `).join("");
+
+  return `
+    <p class="card-kicker">N train</p>
+    <h2>to ${escapeHtml(data.destination || "—")}</h2>
+    <p class="card-where">${where}</p>
+    <div class="progress"><i style="width:${clamp(percent, 2, 100)}%"></i></div>
+    <p class="card-eta">Arriving in <strong>${countdown(eta)}</strong>${data.track ? ` · track ${escapeHtml(data.track)}` : ""}</p>
+    <button type="button" class="follow ${following ? "is-on" : ""}" id="follow">${following ? "Stop following" : "Follow this train"}</button>
+    <ol class="stops">${upcoming}</ol>
+    <p class="card-meta">${escapeHtml(data.trainId || data.id)}</p>
+  `;
+}
+
+function stationCard(station, now) {
+  const rows = arrivalsAt(station.id, now);
+  const list = rows.length
+    ? rows.slice(0, 8).map((row) => `
+        <li class="${row.directionId === 0 ? "to-astoria" : "to-coney"}" data-at="${Math.round(now + row.seconds)}">
+          <span>${escapeHtml(row.destination || "—")}</span><em>${countdown(row.seconds)}</em>
+        </li>
+      `).join("")
+    : '<li class="empty"><span>No N trains scheduled right now</span></li>';
+
+  return `
+    <p class="card-kicker">Station</p>
+    <h2>${escapeHtml(station.name)}</h2>
+    <ol class="stops arrivals">${list}</ol>
+  `;
+}
+
+function renderCard() {
+  if (!selection) {
+    dom.card.hidden = true;
+    return;
+  }
+
+  const now = serverNow();
+  if (selection.kind === "train") {
+    const train = trains.get(selection.id);
+    if (!train) return clearSelection();
+    dom.cardBody.innerHTML = trainCard(train, now);
+    document.getElementById("follow")?.addEventListener("click", () => {
+      following = !following;
+      if (following) map.setView(layerToLatLng(train.point), Math.max(map.getZoom(), FOLLOW_ZOOM));
+      renderCard();
+    });
+  } else {
+    const station = network.stations[selection.id];
+    if (!station) return clearSelection();
+    dom.cardBody.innerHTML = stationCard(station, now);
+  }
+
+  dom.card.hidden = false;
+}
+
+/**
+ * Between polls only the numbers move, so patch them in place. Rebuilding the
+ * card every tick would blow away a click the moment the user makes it.
+ */
+function tickCard() {
+  if (!selection || dom.card.hidden) return;
+  const now = serverNow();
+
+  if (selection.kind === "train") {
+    const train = trains.get(selection.id);
+    if (!train) return clearSelection();
+
+    const bar = dom.cardBody.querySelector(".progress i");
+    if (bar) bar.style.width = `${clamp(Math.round((train.rendered ?? 0) * 100), 2, 100)}%`;
+    const eta = dom.cardBody.querySelector(".card-eta strong");
+    if (eta) eta.textContent = countdown(Math.round(train.data.arrivesAt - now));
+  }
+
+  for (const row of dom.cardBody.querySelectorAll(".stops li[data-at]")) {
+    row.querySelector("em").textContent = countdown(Number(row.dataset.at) - now);
+  }
+}
+
+function layerToLatLng(point) {
+  return map.layerPointToLatLng(L.point(point.x, point.y));
+}
+
+function applySelectionClasses() {
+  document.body.classList.toggle("has-selection", selection?.kind === "train");
+  for (const train of trains.values()) {
+    train.element.classList.toggle("is-selected", selection?.kind === "train" && selection.id === train.id);
+  }
+  for (const [id, marker] of stationMarkers) {
+    const element = marker.getElement();
+    if (element) element.classList.toggle("is-selected", selection?.kind === "station" && selection.id === id);
+  }
+}
+
+function select(next) {
+  selection = next;
+  if (next.kind !== "train") following = false;
+  applySelectionClasses();
+  renderCard();
+}
+
+function clearSelection() {
+  selection = null;
+  following = false;
+  applySelectionClasses();
+  dom.card.hidden = true;
+}
+
+// --------------------------------------------------------------------- status
+
+function renderStatus() {
+  if (!lastPayload) return;
+
+  const age = serverNow() - (lastPayload.fetchedAt ?? serverNow());
+  const stale = lastPayload.stale || age > STALE_AFTER_S;
+  const count = trains.size;
+
+  dom.statusCount.textContent = `${count} ${count === 1 ? "train" : "trains"}`;
+  dom.status.classList.toggle("is-stale", stale);
+  dom.statusNote.textContent = lastPayload.error
+    ? "feed unreachable — showing last known positions"
+    : stale
+      ? `feed ${Math.round(age)}s behind`
+      : "live from the MTA";
+}
+
+function showFailure(message) {
+  dom.status.classList.add("is-stale");
+  dom.statusCount.textContent = "offline";
+  dom.statusNote.textContent = message;
+}
+
+// ------------------------------------------------------------------- the loop
+
+function frame(timestamp) {
+  const dt = Math.min(0.1, (timestamp - lastFrame) / 1000);
+  lastFrame = timestamp;
+
+  if (network) {
+    const now = serverNow();
+    renderTrains(dt, now);
+
+    if (following && selection?.kind === "train") {
+      const train = trains.get(selection.id);
+      if (train?.point) map.panTo(layerToLatLng(train.point), { animate: false });
+    }
+
+    stripFrame += 1;
+    if (stripFrame % 6 === 0) renderStrip(now);
+    if (stripFrame % 30 === 0) {
+      renderStatus();
+      tickCard();
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------------- data
+
+async function loadNetwork() {
+  const response = await fetch("/api/network");
+  if (!response.ok) throw new Error(`network ${response.status}`);
+  network = await response.json();
+  drawNetwork();
+  refreshLabels();
+  refreshScale();
+}
+
+async function poll() {
+  const started = performance.now();
+  const response = await fetch("/api/trains", { cache: "no-store" });
+  if (!response.ok) throw new Error(`trains ${response.status}`);
+  const payload = await response.json();
+
+  const roundTrip = (performance.now() - started) / 1000;
+  const sample = payload.serverTime + roundTrip / 2 - Date.now() / 1000;
+  offsetSamples.push(sample);
+  if (offsetSamples.length > 5) offsetSamples.shift();
+  clockOffset = [...offsetSamples].sort((a, b) => a - b)[Math.floor(offsetSamples.length / 2)];
+
+  lastPayload = payload;
+  syncTrains(payload);
+  renderStatus();
+  if (selection) renderCard();
+}
+
+async function tick() {
+  try {
+    await poll();
+  } catch (error) {
+    showFailure("cannot reach the server");
+  }
+}
+
+// ---------------------------------------------------------------- interaction
+
+map.on("zoomend viewreset", () => {
+  geometryCache.clear();
+  for (const train of trains.values()) train.snap = true;
+  refreshLabels();
+  refreshScale();
+});
+
+map.on("dragstart", () => {
+  if (following) {
+    following = false;
+    if (selection) renderCard();
+  }
+});
+
+map.on("click", clearSelection);
+dom.cardClose.addEventListener("click", clearSelection);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") clearSelection();
+});
+
+document.getElementById("zoom-in").addEventListener("click", () => map.zoomIn(1));
+document.getElementById("zoom-out").addEventListener("click", () => map.zoomOut(1));
+document.getElementById("fit").addEventListener("click", () => {
+  following = false;
+  map.fitBounds(homeBounds, { paddingTopLeft: [56, 90], paddingBottomRight: [56, 130] });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) tick();
+});
+
+window.addEventListener("resize", () => {
+  geometryCache.clear();
+  renderStrip(serverNow());
+});
 
 async function boot() {
   try {
-    await loadRoute();
-    await refreshTrains();
-    map.on("resize", syncTrainsToMap);
-
-    if (!animationStarted) {
-      animationStarted = true;
-      requestAnimationFrame(renderFrame);
-    }
-
-    setInterval(() => {
-      refreshTrains().catch(() => {
-        fallbackEl.textContent = "";
-      });
-    }, REFRESH_MS);
-  } catch {
-    fallbackEl.textContent = "";
-    fallbackEl.classList.add("is-visible");
+    await loadNetwork();
+  } catch (error) {
+    showFailure("could not load the line");
+    return;
   }
+
+  requestAnimationFrame(frame);
+  await tick();
+  setInterval(tick, POLL_MS);
 }
 
 boot();

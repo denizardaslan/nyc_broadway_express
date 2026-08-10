@@ -1,9 +1,14 @@
 {
-  "name": "nyc-n-train-live",
-  "version": "1.0.0",
+  "name": "nyc-broadway-express",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "mock": "node tools/mock-feed.js"
   }
 }
