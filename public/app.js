@@ -1,14 +1,18 @@
-const REFRESH_MS = 20_000;
-const LINE_COLOR = "#fccc0a";
-const MAX_VISIBLE_TRAINS = 26;
-const TANGENT_LOOKAHEAD = 22;
-const DEFAULT_METERS_PER_SECOND = 10.5;
-const MAX_METERS_PER_SECOND = 18;
-const MAX_CORRECTION_METERS = 420;
-const CORRECTION_SECONDS = 22;
-const VELOCITY_BLEND = 0.42;
-const PROJECTION_DISTANCE_WEIGHT = 0.42;
-const REVERSE_CORRECTION_TOLERANCE = 2.5;
+/**
+ * NYC N Train — the original single scene: the city behind, the line in front,
+ * the trains on it. No controls, no panels.
+ *
+ * What changed underneath (and only underneath): the server places each train
+ * on the stretch of track it is actually running, bounded by two timestamps,
+ * and this file evaluates that placement against a server-synchronised clock
+ * every frame. Position is a pure function of feed + time, so a reload lands
+ * every train exactly where it was.
+ */
+
+const REFRESH_MS = 15_000;
+const RECONCILE_TAU = 0.35;
+
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const map = L.map("map", {
   attributionControl: false,
@@ -31,11 +35,10 @@ const fallbackEl = document.querySelector("#fallback");
 const trainLayer = L.DomUtil.create("div", "train-layer", map.getPanes().overlayPane);
 const trains = new Map();
 
-let routeLatLngs = [];
-let routeLine;
-let routeSamples = [];
-let totalRouteDistance = 0;
-let totalRouteMeters = 0;
+let network = null;
+let clockOffset = 0;
+const offsetSamples = [];
+const geometryCache = new Map();
 let lastFrameTime = performance.now();
 let animationStarted = false;
 
@@ -43,134 +46,111 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function interpolatePoint(a, b, t) {
-  return L.point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
-}
-
-function pointDistance(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-function directionSign(directionId) {
-  return directionId === 1 ? -1 : 1;
-}
-
 function shortestAngle(from, to) {
   return ((to - from + 540) % 360) - 180;
 }
 
-function pixelsPerMeter() {
-  return totalRouteMeters ? totalRouteDistance / totalRouteMeters : 0;
+const serverNow = () => Date.now() / 1000 + clockOffset;
+
+/** Matches the easing the server uses, so both agree on where a train is. */
+function ease(t) {
+  const smooth = t * t * (3 - 2 * t);
+  return t * 0.55 + smooth * 0.45;
 }
 
-function defaultVelocity(directionId) {
-  return directionSign(directionId) * DEFAULT_METERS_PER_SECOND * pixelsPerMeter();
-}
+// ------------------------------------------------------------------- geometry
 
-function shouldPredict(item) {
-  return item.status === 2;
-}
+/**
+ * Track geometry in layer pixels per stop-pair link, with cumulative lengths.
+ * Rebuilt whenever the map's pixel origin changes (zoom, resize).
+ */
+function geometryFor(key) {
+  const cached = geometryCache.get(key);
+  if (cached) return cached;
 
-function velocityForItem(item) {
-  return shouldPredict(item) ? defaultVelocity(item.directionId) : 0;
-}
+  const segment = network.segments[key];
+  if (!segment) return null;
 
-function clampVelocity(velocity) {
-  const max = MAX_METERS_PER_SECOND * pixelsPerMeter();
-  return clamp(velocity, -max, max);
-}
-
-function clampCorrection(distance) {
-  const max = Math.max(8, MAX_CORRECTION_METERS * pixelsPerMeter());
-  return clamp(distance, -max, max);
-}
-
-function rebuildRouteSamples() {
-  const points = routeLatLngs.map((latLng) => map.latLngToLayerPoint(latLng));
-  routeSamples = [];
-  totalRouteDistance = 0;
-  totalRouteMeters = 0;
-
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const a = points[index];
-    const b = points[index + 1];
-    const length = pointDistance(a, b);
-    if (length < 0.1) continue;
-    const meters = routeLatLngs[index].distanceTo(routeLatLngs[index + 1]);
-
-    routeSamples.push({
-      a,
-      b,
-      angle: Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI,
-      distance: totalRouteDistance,
-      length,
-      meters
-    });
-    totalRouteDistance += length;
-    totalRouteMeters += meters;
+  const points = segment.path.map(([lat, lon]) => map.latLngToLayerPoint(L.latLng(lat, lon)));
+  const cumulative = [0];
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += points[i].distanceTo(points[i - 1]);
+    cumulative.push(total);
   }
+
+  const geometry = { points, cumulative, length: total };
+  geometryCache.set(key, geometry);
+  return geometry;
 }
 
-function projectToRoute(latLng, preferredDistance = null) {
-  const point = map.latLngToLayerPoint(latLng);
-  let best = null;
+function pointAlong(geometry, fraction) {
+  const target = clamp(fraction, 0, 1) * geometry.length;
+  let index = 0;
+  while (index < geometry.cumulative.length - 2 && geometry.cumulative[index + 1] < target) index += 1;
 
-  for (const segment of routeSamples) {
-    const vx = segment.b.x - segment.a.x;
-    const vy = segment.b.y - segment.a.y;
-    const wx = point.x - segment.a.x;
-    const wy = point.y - segment.a.y;
-    const t = clamp((wx * vx + wy * vy) / (segment.length * segment.length), 0, 1);
-    const candidate = interpolatePoint(segment.a, segment.b, t);
-    const offRoute = pointDistance(point, candidate);
-    const distance = segment.distance + segment.length * t;
-    const distancePenalty = Number.isFinite(preferredDistance)
-      ? Math.abs(distance - preferredDistance) * PROJECTION_DISTANCE_WEIGHT
-      : 0;
-    const score = offRoute + distancePenalty;
+  const start = geometry.cumulative[index];
+  const span = geometry.cumulative[index + 1] - start || 1;
+  const t = clamp((target - start) / span, 0, 1);
+  const a = geometry.points[index];
+  const b = geometry.points[index + 1] ?? a;
 
-    if (!best || score < best.score) {
-      best = {
-        angle: segment.angle,
-        distance,
-        offRoute,
-        point: candidate,
-        score
-      };
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    angle: (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI
+  };
+}
+
+// ------------------------------------------------------------------- the line
+
+function drawNetwork() {
+  const rails = [];
+  const lines = [];
+  const centers = [];
+
+  // Every physical link the N uses — bridge and tunnel routes alike — drawn in
+  // the original three passes: black rail, yellow line, dotted centre.
+  for (const edge of network.edges) {
+    const latLngs = edge.path.map(([lat, lon]) => L.latLng(lat, lon));
+    rails.push(L.polyline(latLngs, {
+      className: "route-rail",
+      color: "#171717",
+      interactive: false,
+      opacity: 1,
+      weight: 13
+    }));
+    lines.push(L.polyline(latLngs, {
+      className: "route-line",
+      color: network.route.color || "#fccc0a",
+      interactive: false,
+      opacity: 1,
+      weight: 7
+    }));
+    centers.push(L.polyline(latLngs, {
+      className: "route-center",
+      color: "#171717",
+      interactive: false,
+      opacity: 0.9,
+      weight: 1.25
+    }));
+  }
+
+  L.layerGroup(rails).addTo(map);
+  L.layerGroup(lines).addTo(map);
+  L.layerGroup(centers).addTo(map);
+
+  map.fitBounds(
+    L.latLngBounds(Object.values(network.stations).map((s) => [s.lat, s.lon])),
+    {
+      animate: false,
+      paddingTopLeft: [82, 36],
+      paddingBottomRight: [64, 36]
     }
-  }
-
-  return best || { angle: -90, distance: 0, point };
+  );
 }
 
-function rawPointAtDistance(distance) {
-  const bounded = clamp(distance, 0, totalRouteDistance);
-  const last = routeSamples[routeSamples.length - 1];
-  const segment = routeSamples.find((item) => bounded <= item.distance + item.length) || last;
-  const t = clamp((bounded - segment.distance) / segment.length, 0, 1);
-
-  return {
-    segment,
-    point: interpolatePoint(segment.a, segment.b, t)
-  };
-}
-
-function tangentAngleAtDistance(distance, directionId) {
-  const sign = directionSign(directionId);
-  const behind = rawPointAtDistance(distance - sign * TANGENT_LOOKAHEAD).point;
-  const ahead = rawPointAtDistance(distance + sign * TANGENT_LOOKAHEAD).point;
-  return Math.atan2(ahead.y - behind.y, ahead.x - behind.x) * 180 / Math.PI;
-}
-
-function pointAtDistance(distance, directionId) {
-  const sampled = rawPointAtDistance(distance);
-  return {
-    angle: tangentAngleAtDistance(distance, directionId),
-    point: sampled.point
-  };
-}
+// --------------------------------------------------------------------- trains
 
 function makeTrainElement(directionId) {
   const node = document.createElement("div");
@@ -187,173 +167,75 @@ function makeTrainElement(directionId) {
   return node;
 }
 
-function placeTrain(train) {
-  const projected = pointAtDistance(train.distance, train.directionId);
-  train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${projected.angle}deg)`;
+function targetFraction(train, now) {
+  const data = train.data;
+  if (!data.segment) return 1;
+  const span = data.arrivesAt - data.departedAt;
+  if (!(span > 0)) return 1;
+  if (data.atStation) return 1;
+  return clamp((now - data.departedAt) / span, 0, 1);
 }
 
-function renderFrame(now) {
-  const dt = Math.min(0.05, (now - lastFrameTime) / 1000);
-  lastFrameTime = now;
+function renderFrame(nowMs) {
+  const dt = Math.min(0.1, (nowMs - lastFrameTime) / 1000);
+  lastFrameTime = nowMs;
 
-  for (const train of trains.values()) {
-    const correctionStep = train.correction * Math.min(1, dt / CORRECTION_SECONDS);
-    train.correction -= correctionStep;
-    train.distance = clamp(train.distance + train.velocity * dt + correctionStep, 0, totalRouteDistance);
-    const routeAngle = tangentAngleAtDistance(train.distance, train.directionId);
-    train.angle = (train.angle ?? routeAngle) + shortestAngle(train.angle ?? routeAngle, routeAngle) * 0.18;
-    train.distanceRatio = totalRouteDistance ? train.distance / totalRouteDistance : 0;
-    const projected = rawPointAtDistance(train.distance);
-    train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${train.angle}deg)`;
+  if (network) {
+    const now = serverNow();
+
+    for (const train of trains.values()) {
+      const target = ease(targetFraction(train, now));
+
+      if (train.rendered === null || train.snap) {
+        train.rendered = target;
+        train.snap = false;
+      } else {
+        const pull = reduceMotion ? 1 : 1 - Math.exp(-dt / RECONCILE_TAU);
+        train.rendered += (target - train.rendered) * pull;
+      }
+
+      const geometry = train.data.segment ? geometryFor(train.data.segment) : null;
+      let placed;
+
+      if (geometry) {
+        placed = pointAlong(geometry, train.rendered);
+      } else {
+        const station = network.stations[(train.data.to || "").replace(/[NS]$/, "")];
+        if (!station) continue;
+        const point = map.latLngToLayerPoint([station.lat, station.lon]);
+        placed = { x: point.x, y: point.y, angle: train.angle ?? 0 };
+      }
+
+      train.angle = train.angle === null
+        ? placed.angle
+        : train.angle + shortestAngle(train.angle, placed.angle) * (reduceMotion ? 1 : Math.min(1, dt * 6));
+
+      train.element.style.transform =
+        `translate3d(${placed.x.toFixed(1)}px, ${placed.y.toFixed(1)}px, 0) rotate(${train.angle.toFixed(1)}deg)`;
+    }
   }
 
   requestAnimationFrame(renderFrame);
 }
 
-function syncTrainsToMap() {
-  rebuildRouteSamples();
-  for (const train of trains.values()) {
-    train.distance = clamp(train.distanceRatio * totalRouteDistance, 0, totalRouteDistance);
-    const projected = pointAtDistance(train.distance, train.directionId);
-    train.velocity = 0;
-    train.correction = 0;
-    train.element.style.transform = `translate3d(${projected.point.x}px, ${projected.point.y}px, 0) rotate(${projected.angle}deg)`;
-  }
-}
-
-function chooseVisualTrains(items) {
-  const byId = new Map(items.map((item) => [item.id, item]));
-  const buckets = new Map();
-  const selected = [];
-  const used = new Set();
-
-  for (const id of trains.keys()) {
-    const item = byId.get(id);
-    if (!item) continue;
-    if (selected.length >= MAX_VISIBLE_TRAINS) break;
-
-    const existing = trains.get(id);
-    const projected = projectToRoute(L.latLng(item.lat, item.lon), existing?.distance);
-    const key = Math.round(projected.distance / 42);
-    const bucketCount = buckets.get(key) || 0;
-    if (bucketCount >= 2) continue;
-
-    buckets.set(key, bucketCount + 1);
-    selected.push({ item, offset: directionSign(existing.directionId) * bucketCount * 22, projected });
-    used.add(id);
-  }
-
-  const sorted = items.filter((item) => !used.has(item.id)).sort((a, b) => {
-    const aTime = Date.parse(a.vehicleTimestamp || a.nextArrival || 0);
-    const bTime = Date.parse(b.vehicleTimestamp || b.nextArrival || 0);
-    return bTime - aTime;
-  });
-
-  for (const item of sorted) {
-    const projected = projectToRoute(L.latLng(item.lat, item.lon));
-    const key = Math.round(projected.distance / 42);
-    const bucketCount = buckets.get(key) || 0;
-    if (bucketCount >= 2) continue;
-
-    buckets.set(key, bucketCount + 1);
-    selected.push({ item, offset: directionSign(item.directionId) * bucketCount * 22, projected });
-    if (selected.length >= MAX_VISIBLE_TRAINS) break;
-  }
-
-  return selected;
-}
-
-async function loadRoute() {
-  const response = await fetch("/api/route");
-  if (!response.ok) throw new Error("N hattı yüklenemedi");
-  const route = await response.json();
-
-  routeLatLngs = route.shape.map((point) => L.latLng(point.lat, point.lon));
-
-  L.polyline(routeLatLngs, {
-    className: "route-rail",
-    color: "#171717",
-    interactive: false,
-    opacity: 1,
-    weight: 13
-  }).addTo(map);
-
-  L.polyline(routeLatLngs, {
-    className: "route-line",
-    color: LINE_COLOR,
-    interactive: false,
-    opacity: 1,
-    weight: 7
-  }).addTo(map);
-
-  routeLine = L.polyline(routeLatLngs, {
-    className: "route-center",
-    color: "#171717",
-    interactive: false,
-    opacity: 0.9,
-    weight: 1.25
-  }).addTo(map);
-
-  map.fitBounds(routeLine.getBounds(), {
-    animate: false,
-    paddingTopLeft: [82, 36],
-    paddingBottomRight: [64, 36]
-  });
-  rebuildRouteSamples();
-}
-
-async function refreshTrains() {
-  const response = await fetch("/api/trains");
-  if (!response.ok) throw new Error("Canlı tren verisi alınamadı");
-  const payload = await response.json();
+function syncTrains(payload) {
   const seen = new Set();
-  const visualTrains = chooseVisualTrains(payload.trains);
 
-  for (const { item, offset, projected } of visualTrains) {
-    seen.add(item.id);
-    const rawTargetDistance = clamp(projected.distance + offset, 0, totalRouteDistance);
-    const existing = trains.get(item.id);
-    const observedAt = Date.parse(payload.updatedAt) || Date.now();
-    const predictive = shouldPredict(item);
+  for (const data of payload.trains) {
+    seen.add(data.id);
+    const existing = trains.get(data.id);
 
     if (existing) {
-      const elapsed = Math.max(1, (observedAt - existing.lastObservedAt) / 1000);
-      const observedDelta = rawTargetDistance - existing.lastObservedDistance;
-      const observedVelocity = clampVelocity((rawTargetDistance - existing.lastObservedDistance) / elapsed);
-      const expectedDirection = directionSign(existing.directionId);
-      const directionallyValid = Math.sign(observedVelocity || expectedDirection) === expectedDirection;
-
-      existing.velocity = predictive && elapsed > 4 && directionallyValid && Math.abs(observedDelta) > 0.5
-        ? existing.velocity * (1 - VELOCITY_BLEND) + observedVelocity * VELOCITY_BLEND
-        : velocityForItem(item);
-      existing.velocity = clampVelocity(existing.velocity);
-      existing.element.classList.toggle("is-predicting", predictive);
-
-      const targetDelta = rawTargetDistance - existing.distance;
-      const correctionDirectionallyValid = Math.sign(targetDelta || expectedDirection) === expectedDirection;
-      existing.correction = correctionDirectionallyValid || Math.abs(targetDelta) <= REVERSE_CORRECTION_TOLERANCE
-        ? clampCorrection(existing.correction + targetDelta)
-        : 0;
-      existing.lastObservedAt = observedAt;
-      existing.lastObservedDistance = rawTargetDistance;
+      // A new link restarts the fraction at 0; easing towards it would drag
+      // the train backwards. Geometry is continuous across links anyway.
+      existing.snap = existing.data.segment !== data.segment;
+      existing.data = data;
+      existing.element.classList.toggle("is-predicting", !data.atStation);
     } else {
-      const element = makeTrainElement(item.directionId);
-      element.dataset.trainId = item.id;
-      const target = pointAtDistance(rawTargetDistance, item.directionId);
-      const train = {
-        correction: 0,
-        directionId: item.directionId,
-        distance: rawTargetDistance,
-        distanceRatio: totalRouteDistance ? rawTargetDistance / totalRouteDistance : 0,
-        element,
-        lastObservedAt: observedAt,
-        lastObservedDistance: rawTargetDistance,
-        velocity: velocityForItem(item)
-      };
-      train.angle = target.angle;
-      trains.set(item.id, train);
-      element.classList.toggle("is-predicting", predictive);
-      train.element.style.transform = `translate3d(${target.point.x}px, ${target.point.y}px, 0) rotate(${target.angle}deg)`;
+      const element = makeTrainElement(data.directionId);
+      element.dataset.trainId = data.id;
+      element.classList.toggle("is-predicting", !data.atStation);
+      trains.set(data.id, { data, element, rendered: null, angle: null, snap: false });
       requestAnimationFrame(() => element.classList.add("is-live"));
     }
   }
@@ -369,11 +251,41 @@ async function refreshTrains() {
   fallbackEl.classList.remove("is-visible");
 }
 
+// ----------------------------------------------------------------------- data
+
+async function loadNetwork() {
+  const response = await fetch("/api/network");
+  if (!response.ok) throw new Error("N hattı yüklenemedi");
+  network = await response.json();
+  drawNetwork();
+}
+
+async function refreshTrains() {
+  const started = performance.now();
+  const response = await fetch("/api/trains", { cache: "no-store" });
+  if (!response.ok) throw new Error("Canlı tren verisi alınamadı");
+  const payload = await response.json();
+
+  const roundTrip = (performance.now() - started) / 1000;
+  offsetSamples.push(payload.serverTime + roundTrip / 2 - Date.now() / 1000);
+  if (offsetSamples.length > 5) offsetSamples.shift();
+  clockOffset = [...offsetSamples].sort((a, b) => a - b)[Math.floor(offsetSamples.length / 2)];
+
+  syncTrains(payload);
+}
+
+function handleViewChange() {
+  geometryCache.clear();
+  for (const train of trains.values()) train.snap = true;
+}
+
 async function boot() {
   try {
-    await loadRoute();
+    await loadNetwork();
     await refreshTrains();
-    map.on("resize", syncTrainsToMap);
+
+    map.on("zoomend viewreset", handleViewChange);
+    map.on("resize", handleViewChange);
 
     if (!animationStarted) {
       animationStarted = true;
@@ -390,5 +302,9 @@ async function boot() {
     fallbackEl.classList.add("is-visible");
   }
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && network) refreshTrains().catch(() => {});
+});
 
 boot();
