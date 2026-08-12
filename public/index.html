@@ -1,11 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="tr">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>N — a live portrait of the Broadway line</title>
-    <meta name="description" content="Every N train in New York City, moving in real time. A quiet, living picture of one subway line.">
-    <meta name="theme-color" content="#f4f1e8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NYC N Train Live</title>
     <script async src="https://www.googletagmanager.com/gtag/js?id=G-57NL6ZY4T3"></script>
     <script>
       window.dataLayer = window.dataLayer || [];
@@ -13,28 +11,21 @@
       gtag("js", new Date());
       gtag("config", "G-57NL6ZY4T3");
     </script>
-    <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <main class="scene">
-      <div id="map" aria-label="Every N train in New York City, moving in real time"></div>
-      <div class="grain" aria-hidden="true"></div>
-      <div class="vignette" aria-hidden="true"></div>
-
-      <header class="mark" aria-hidden="true">
-        <span class="bullet">N</span>
-        <span class="wordmark">
-          <b>Broadway</b>
-          <i>New York City</i>
-        </span>
+    <main class="app" aria-label="NYC N train live visualizer">
+      <div id="map" aria-label="Live N train movement scene"></div>
+      <div class="atmosphere" aria-hidden="true"></div>
+      <header class="brand" aria-label="NYC N Train">
+        <div class="route-badge" aria-hidden="true">N</div>
+        <div class="brand-title">
+          <span>NYC</span>
+          <strong>N TRAIN</strong>
+        </div>
       </header>
-
-      <footer class="caption" aria-hidden="true">
-        <span class="terminals">Astoria–Ditmars Blvd &nbsp;·&nbsp; Coney Island–Stillwell Av</span>
-        <span class="pulse" id="pulse"><i></i><span id="count">—</span> trains running</span>
-      </footer>
+      <div id="fallback" class="fallback" role="status" aria-live="polite"></div>
     </main>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

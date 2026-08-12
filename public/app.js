@@ -1,65 +1,55 @@
 /**
- * A living picture of one subway line.
+ * NYC N Train — the original single scene: the city behind, the line in front,
+ * the trains on it. No controls, no panels.
  *
- * There is no interface here on purpose — the map, the line and the trains are
- * the whole piece. What keeps it honest is underneath: the server hands each
- * train a link (the stretch of track between two stops) and the two timestamps
- * that bound it, and position is a pure function of those and the clock. No
- * simulation carries state between frames, so the picture is the same in two
- * tabs and survives a reload.
+ * What changed underneath (and only underneath): the server places each train
+ * on the stretch of track it is actually running, bounded by two timestamps,
+ * and this file evaluates that placement against a server-synchronised clock
+ * every frame. Position is a pure function of feed + time, so a reload lands
+ * every train exactly where it was.
  */
 
-const POLL_MS = 15_000;
-const THEME_CHECK_MS = 5 * 60_000;
-const IDLE_RESTORE_MS = 25_000;
+const REFRESH_MS = 15_000;
 const RECONCILE_TAU = 0.35;
-const TRACK_OFFSET_PX = 4.5;
-const RIPPLE_MS = 2600;
 
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-const TILES = {
-  day: "https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png",
-  night: "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
-};
-
-const dom = {
-  count: document.getElementById("count"),
-  pulse: document.getElementById("pulse")
-};
-
 const map = L.map("map", {
   attributionControl: false,
+  boxZoom: false,
+  doubleClickZoom: false,
+  dragging: false,
+  keyboard: false,
+  scrollWheelZoom: false,
+  touchZoom: false,
   zoomControl: false,
-  zoomSnap: 0.25,
-  zoomDelta: 0.5,
-  minZoom: 9,
-  maxZoom: 17
-}).setView([40.72, -73.98], 11);
+  zoomDelta: 0.1,
+  zoomSnap: 0.1
+}).setView([40.735, -73.985], 11);
 
-const tiles = L.tileLayer(TILES.day, { maxZoom: 19, detectRetina: true }).addTo(map);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png", {
+  maxZoom: 20
+}).addTo(map);
 
-const trainPane = map.createPane("trains");
-trainPane.style.zIndex = 620;
-trainPane.style.pointerEvents = "none";
+const fallbackEl = document.querySelector("#fallback");
+const trainLayer = L.DomUtil.create("div", "train-layer", map.getPanes().overlayPane);
+const trains = new Map();
 
 let network = null;
-let homeBounds = null;
 let clockOffset = 0;
 const offsetSamples = [];
-
-const trains = new Map();
 const geometryCache = new Map();
+let lastFrameTime = performance.now();
+let animationStarted = false;
 
-let theme = null;
-let lastFrame = performance.now();
-let userMovedAt = 0;
-let restoring = false;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
 
-// ------------------------------------------------------------------ utilities
+function shortestAngle(from, to) {
+  return ((to - from + 540) % 360) - 180;
+}
 
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-const baseId = (stopId = "") => stopId.replace(/[NS]$/, "");
 const serverNow = () => Date.now() / 1000 + clockOffset;
 
 /** Matches the easing the server uses, so both agree on where a train is. */
@@ -68,40 +58,12 @@ function ease(t) {
   return t * 0.55 + smooth * 0.45;
 }
 
-function shortestAngle(from, to) {
-  return ((to - from + 540) % 360) - 180;
-}
-
-// --------------------------------------------------------------- day and night
-
-function newYorkHour() {
-  const formatted = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    hour: "2-digit",
-    hourCycle: "h23"
-  }).format(new Date());
-  return Number(formatted);
-}
-
-function intendedTheme() {
-  const forced = new URLSearchParams(location.search).get("theme");
-  if (forced === "day" || forced === "night") return forced;
-  const hour = newYorkHour();
-  return Number.isFinite(hour) && (hour >= 19 || hour < 6) ? "night" : "day";
-}
-
-function applyTheme() {
-  const next = intendedTheme();
-  if (next === theme) return;
-  theme = next;
-  document.documentElement.dataset.theme = theme;
-  tiles.setUrl(TILES[theme]);
-  document.querySelector('meta[name="theme-color"]')
-    ?.setAttribute("content", theme === "night" ? "#0b0d12" : "#f4f1e8");
-}
-
 // ------------------------------------------------------------------- geometry
 
+/**
+ * Track geometry in layer pixels per stop-pair link, with cumulative lengths.
+ * Rebuilt whenever the map's pixel origin changes (zoom, resize).
+ */
 function geometryFor(key) {
   const cached = geometryCache.get(key);
   if (cached) return cached;
@@ -140,70 +102,69 @@ function pointAlong(geometry, fraction) {
   };
 }
 
-// -------------------------------------------------------------- the line drawn
+// ------------------------------------------------------------------- the line
 
 function drawNetwork() {
-  const casing = [];
-  const core = [];
+  const rails = [];
+  const lines = [];
+  const centers = [];
 
+  // Every physical link the N uses — bridge and tunnel routes alike — drawn in
+  // the original three passes: black rail, yellow line, dotted centre.
   for (const edge of network.edges) {
     const latLngs = edge.path.map(([lat, lon]) => L.latLng(lat, lon));
-    casing.push(L.polyline(latLngs, { className: "rail-casing", interactive: false }));
-    core.push(L.polyline(latLngs, { className: "rail-core", interactive: false }));
+    rails.push(L.polyline(latLngs, {
+      className: "route-rail",
+      color: "#171717",
+      interactive: false,
+      opacity: 1,
+      weight: 13
+    }));
+    lines.push(L.polyline(latLngs, {
+      className: "route-line",
+      color: network.route.color || "#fccc0a",
+      interactive: false,
+      opacity: 1,
+      weight: 7
+    }));
+    centers.push(L.polyline(latLngs, {
+      className: "route-center",
+      color: "#171717",
+      interactive: false,
+      opacity: 0.9,
+      weight: 1.25
+    }));
   }
 
-  L.layerGroup(casing).addTo(map);
-  L.layerGroup(core).addTo(map);
+  L.layerGroup(rails).addTo(map);
+  L.layerGroup(lines).addTo(map);
+  L.layerGroup(centers).addTo(map);
 
-  for (const station of Object.values(network.stations)) {
-    L.circleMarker([station.lat, station.lon], {
-      className: station.terminal ? "stop stop-terminal" : "stop",
-      radius: station.terminal ? 4.5 : 2.6,
-      interactive: false
-    }).addTo(map);
-  }
-
-  homeBounds = L.latLngBounds(Object.values(network.stations).map((s) => [s.lat, s.lon]));
-  frameLine(false);
+  map.fitBounds(
+    L.latLngBounds(Object.values(network.stations).map((s) => [s.lat, s.lon])),
+    {
+      animate: false,
+      paddingTopLeft: [82, 36],
+      paddingBottomRight: [64, 36]
+    }
+  );
 }
 
-/** The composition: the line, centred, with room to breathe. */
-function framePadding() {
-  const short = Math.min(window.innerWidth, window.innerHeight);
-  const inset = clamp(Math.round(short * 0.11), 26, 90);
-  return { paddingTopLeft: [inset, inset + 42], paddingBottomRight: [inset, inset + 52] };
-}
+// --------------------------------------------------------------------- trains
 
-function frameLine(animate) {
-  if (!homeBounds) return;
-  map.flyToBounds(homeBounds, { ...framePadding(), duration: animate ? 2.4 : 0, animate });
-}
-
-// ---------------------------------------------------------------------- trains
-
-function makeTrainElement(data) {
-  const element = document.createElement("div");
-  element.className = "train";
-  element.dataset.direction = data.directionId === 0 ? "astoria" : "coney";
-  element.innerHTML = '<span class="trail"></span><span class="glow"></span><span class="car"></span>';
-  trainPane.append(element);
-  return element;
-}
-
-/** A ring where a train is standing at a platform. The line's heartbeat. */
-function ripple(stationBaseId) {
-  if (reduceMotion) return;
-  const station = network.stations[stationBaseId];
-  if (!station) return;
-
-  const point = map.latLngToLayerPoint([station.lat, station.lon]);
-  const ring = document.createElement("span");
-  ring.className = "ripple";
-  // The keyframes animate transform, so the position travels as a variable.
-  ring.style.setProperty("--x", `${point.x.toFixed(1)}px`);
-  ring.style.setProperty("--y", `${point.y.toFixed(1)}px`);
-  trainPane.append(ring);
-  setTimeout(() => ring.remove(), RIPPLE_MS);
+function makeTrainElement(directionId) {
+  const node = document.createElement("div");
+  node.className = "train";
+  node.dataset.direction = directionId === 1 ? "south" : "north";
+  node.innerHTML = [
+    '<span class="motion motion-a"></span>',
+    '<span class="motion motion-b"></span>',
+    '<span class="motion motion-c"></span>',
+    '<span class="car"></span>',
+    '<span class="beacon"></span>'
+  ].join("");
+  trainLayer.append(node);
+  return node;
 }
 
 function targetFraction(train, now) {
@@ -215,43 +176,46 @@ function targetFraction(train, now) {
   return clamp((now - data.departedAt) / span, 0, 1);
 }
 
-function renderTrains(dt, now) {
-  for (const train of trains.values()) {
-    const target = ease(targetFraction(train, now));
+function renderFrame(nowMs) {
+  const dt = Math.min(0.1, (nowMs - lastFrameTime) / 1000);
+  lastFrameTime = nowMs;
 
-    if (train.rendered === null || train.snap) {
-      train.rendered = target;
-      train.snap = false;
-    } else {
-      const pull = reduceMotion ? 1 : 1 - Math.exp(-dt / RECONCILE_TAU);
-      train.rendered += (target - train.rendered) * pull;
+  if (network) {
+    const now = serverNow();
+
+    for (const train of trains.values()) {
+      const target = ease(targetFraction(train, now));
+
+      if (train.rendered === null || train.snap) {
+        train.rendered = target;
+        train.snap = false;
+      } else {
+        const pull = reduceMotion ? 1 : 1 - Math.exp(-dt / RECONCILE_TAU);
+        train.rendered += (target - train.rendered) * pull;
+      }
+
+      const geometry = train.data.segment ? geometryFor(train.data.segment) : null;
+      let placed;
+
+      if (geometry) {
+        placed = pointAlong(geometry, train.rendered);
+      } else {
+        const station = network.stations[(train.data.to || "").replace(/[NS]$/, "")];
+        if (!station) continue;
+        const point = map.latLngToLayerPoint([station.lat, station.lon]);
+        placed = { x: point.x, y: point.y, angle: train.angle ?? 0 };
+      }
+
+      train.angle = train.angle === null
+        ? placed.angle
+        : train.angle + shortestAngle(train.angle, placed.angle) * (reduceMotion ? 1 : Math.min(1, dt * 6));
+
+      train.element.style.transform =
+        `translate3d(${placed.x.toFixed(1)}px, ${placed.y.toFixed(1)}px, 0) rotate(${train.angle.toFixed(1)}deg)`;
     }
-
-    const geometry = train.data.segment ? geometryFor(train.data.segment) : null;
-    let placed;
-
-    if (geometry) {
-      placed = pointAlong(geometry, train.rendered);
-    } else {
-      const station = network.stations[baseId(train.data.to || "")];
-      if (!station) continue;
-      const point = map.latLngToLayerPoint([station.lat, station.lon]);
-      placed = { x: point.x, y: point.y, angle: train.angle ?? 0 };
-    }
-
-    train.angle = train.angle === null
-      ? placed.angle
-      : train.angle + shortestAngle(train.angle, placed.angle) * (reduceMotion ? 1 : Math.min(1, dt * 6));
-
-    // Each direction rides its own side of the track, as the tracks are laid.
-    const side = train.data.directionId === 0 ? -1 : 1;
-    const radians = (train.angle * Math.PI) / 180;
-    const x = placed.x - Math.sin(radians) * TRACK_OFFSET_PX * side;
-    const y = placed.y + Math.cos(radians) * TRACK_OFFSET_PX * side;
-
-    train.element.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) rotate(${train.angle.toFixed(1)}deg)`;
-    train.element.classList.toggle("is-still", Boolean(train.data.atStation));
   }
+
+  requestAnimationFrame(renderFrame);
 }
 
 function syncTrains(payload) {
@@ -262,69 +226,44 @@ function syncTrains(payload) {
     const existing = trains.get(data.id);
 
     if (existing) {
-      // A new link restarts the fraction at 0, so easing towards it would drag
+      // A new link restarts the fraction at 0; easing towards it would drag
       // the train backwards. Geometry is continuous across links anyway.
       existing.snap = existing.data.segment !== data.segment;
-      const arrived = data.atStation && existing.dwellingAt !== data.to;
-      existing.dwellingAt = data.atStation ? data.to : null;
       existing.data = data;
-      if (arrived) ripple(baseId(data.to));
+      existing.element.classList.toggle("is-predicting", !data.atStation);
     } else {
-      trains.set(data.id, {
-        data,
-        element: makeTrainElement(data),
-        rendered: null,
-        angle: null,
-        snap: false,
-        dwellingAt: data.atStation ? data.to : null
-      });
+      const element = makeTrainElement(data.directionId);
+      element.dataset.trainId = data.id;
+      element.classList.toggle("is-predicting", !data.atStation);
+      trains.set(data.id, { data, element, rendered: null, angle: null, snap: false });
+      requestAnimationFrame(() => element.classList.add("is-live"));
     }
   }
 
   for (const [id, train] of trains) {
-    if (seen.has(id)) continue;
-    train.element.classList.add("is-leaving");
-    setTimeout(() => train.element.remove(), 700);
-    trains.delete(id);
-  }
-
-  dom.count.textContent = payload.trains.length;
-  dom.pulse.classList.toggle("is-stale", Boolean(payload.stale));
-  document.body.classList.remove("is-adrift");
-}
-
-// ------------------------------------------------------------------- the loop
-
-function frame(timestamp) {
-  const dt = Math.min(0.1, (timestamp - lastFrame) / 1000);
-  lastFrame = timestamp;
-
-  if (network) {
-    renderTrains(dt, serverNow());
-
-    if (userMovedAt && Date.now() - userMovedAt > IDLE_RESTORE_MS) {
-      userMovedAt = 0;
-      restoring = true;
-      frameLine(true);
+    if (!seen.has(id)) {
+      train.element.classList.add("is-leaving");
+      setTimeout(() => train.element.remove(), 300);
+      trains.delete(id);
     }
   }
 
-  requestAnimationFrame(frame);
+  fallbackEl.classList.remove("is-visible");
 }
 
 // ----------------------------------------------------------------------- data
 
 async function loadNetwork() {
   const response = await fetch("/api/network");
-  if (!response.ok) throw new Error(`network ${response.status}`);
+  if (!response.ok) throw new Error("N hattı yüklenemedi");
   network = await response.json();
   drawNetwork();
 }
 
-async function poll() {
+async function refreshTrains() {
   const started = performance.now();
   const response = await fetch("/api/trains", { cache: "no-store" });
-  if (!response.ok) throw new Error(`trains ${response.status}`);
+  if (!response.ok) throw new Error("Canlı tren verisi alınamadı");
   const payload = await response.json();
 
   const roundTrip = (performance.now() - started) / 1000;
@@ -335,61 +274,37 @@ async function poll() {
   syncTrains(payload);
 }
 
-async function tick() {
-  try {
-    await poll();
-  } catch {
-    document.body.classList.add("is-adrift");
-  }
-}
-
-// ---------------------------------------------------- gestures, quietly allowed
-
-map.on("zoomend viewreset", () => {
+function handleViewChange() {
   geometryCache.clear();
   for (const train of trains.values()) train.snap = true;
-  for (const ring of trainPane.querySelectorAll(".ripple")) ring.remove();
-});
-
-map.on("dragstart zoomstart", () => {
-  if (!restoring) userMovedAt = Date.now();
-});
-
-map.on("moveend", () => {
-  restoring = false;
-});
-
-let resizeTimer;
-window.addEventListener("resize", () => {
-  geometryCache.clear();
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    if (!userMovedAt) frameLine(false);
-  }, 250);
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    applyTheme();
-    tick();
-  }
-});
+}
 
 async function boot() {
-  applyTheme();
-  setInterval(applyTheme, THEME_CHECK_MS);
-
   try {
     await loadNetwork();
-  } catch {
-    document.body.classList.add("is-adrift");
-    return;
-  }
+    await refreshTrains();
 
-  requestAnimationFrame(frame);
-  await tick();
-  setInterval(tick, POLL_MS);
-  requestAnimationFrame(() => document.body.classList.add("is-awake"));
+    map.on("zoomend viewreset", handleViewChange);
+    map.on("resize", handleViewChange);
+
+    if (!animationStarted) {
+      animationStarted = true;
+      requestAnimationFrame(renderFrame);
+    }
+
+    setInterval(() => {
+      refreshTrains().catch(() => {
+        fallbackEl.textContent = "";
+      });
+    }, REFRESH_MS);
+  } catch {
+    fallbackEl.textContent = "";
+    fallbackEl.classList.add("is-visible");
+  }
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && network) refreshTrains().catch(() => {});
+});
 
 boot();
