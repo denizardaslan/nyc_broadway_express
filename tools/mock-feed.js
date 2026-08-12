@@ -30,7 +30,14 @@ async function loadNetwork() {
   try {
     return JSON.parse(await readFile(path.join(root, ".cache", `network.v${NETWORK_VERSION}.json`), "utf8"));
   } catch {
+    // Fall through to the raw bundle.
+  }
+
+  try {
     return buildNetwork(await readFile(path.join(root, ".cache", "gtfs_subway.zip")));
+  } catch {
+    console.error("No GTFS bundle yet. Run `node server.js` once to fetch it, then start this again.");
+    process.exit(1);
   }
 }
 
